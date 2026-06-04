@@ -1,0 +1,137 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+GDTk (Gas Dynamics Toolkit) is a collection of compressible/reacting gas-dynamics and CFD tools from the University of Queensland's Centre for Hypersonics. The simulation codes are written in **D**, configured by user-supplied **Lua** input scripts, and exposed to users through loadable **Python**/**Ruby** libraries. The bias is toward chemically-reacting, high-temperature, hypersonic flows (shock tunnels, expansion tubes).
+
+## Repository layout (`src/`)
+
+Two generations of the main flow solver coexist and share the same underlying physics libraries:
+
+- **`eilmer/`** — Eilmer 4, the established finite-volume compressible flow solver. Builds `e4shared` (shared-memory), `e4mpi` (distributed), and complex/steady-state variants. Input via Lua + `e4shared --prep/--run/--post`.
+- **`lmr/`** — Eilmer 5 ("lmr"/lorikeet), a reorganization of Eilmer with a single `lmr` executable using a **subcommand** dispatch (see `src/lmr/main.d`; subcommands live in `src/lmr/commands/`). This is where most new solver development happens.
+
+Shared libraries used by both solvers and the standalone tools:
+
+- **`gas/`** — gas models (ideal, CEA, equilibrium, thermally-perfect, multi-temperature). `prep-gas` compiles `.lua` gas inputs into gas-model files.
+- **`kinetics/`** — finite-rate chemistry and thermal energy-exchange. `prep-chem`/`prep-reactions` and `prep-kinetics`/`prep-energy-exchange`.
+- **`geom/`** — geometry primitives, paths, surfaces, structured/unstructured grids.
+- **`nm/`** — numerical methods (linear algebra, root finding, integration). Defines the `number` abstraction (see below).
+- **`gasdyn/`** — analytic gas-dynamic relations (normal/oblique/conical shocks, isentropic flow).
+- **`ntypes/`** — `complex.d`, the `Complex!double` type used for complex-step differentiation.
+- **`util/`**, **`extern/`** — utilities and vendored dependencies (Lua 5.4.3, OpenMPI bindings, eqc, gzip).
+
+Standalone tools each have their own directory: **`l1d/`** (shock-tunnel/expansion-tube end-to-end sim), **`nenzf1d/`**, **`pitot3/`**, **`onedval/`**, **`puffin`/`slf`** (space-marching), **`chicken/`** (GPU solver).
+
+User-facing loadable libraries live in **`src/lib/gdtk/`** (Python package + Lua/Ruby modules): `gas.py`, `ideal_gas_flow.py`, `reflected_shock_tunnel.py`, `lmr.py`, etc.
+
+## Building and installing
+
+Each `src/` subdirectory has its own `makefile`. Build a tool by running `make install` from its directory; this also builds its library dependencies. The default install tree is `$HOME/gdtkinst` (override with `INSTALL_DIR=...`). The install tree is **separate** from the repository tree.
+
+```bash
+cd src/lmr && make install        # build & install Eilmer 5 (lmr)
+cd src/eilmer && make install      # build & install Eilmer 4
+make PLATFORM=macosx install       # macOS needs this hint
+```
+
+After installing, the user's environment must define (see README.md):
+```bash
+export DGD=$HOME/gdtkinst
+export DGD_REPO=$HOME/gdtk
+export PATH=$PATH:$DGD/bin
+export DGD_LUA_PATH=$DGD/lib/?.lua
+export DGD_LUA_CPATH=$DGD/lib/?.so
+```
+
+Compiler: **`ldc2`** (LLVM D compiler) by default; `DMD=dmd` is also accepted. A C compiler, gfortran, and (for MPI builds) OpenMPI are required.
+
+### Key make variables
+
+These select compile-time variants — changing them requires a rebuild (`make clean` first):
+
+- `FLAVOUR` = `debug` (default; runtime checks, detailed errors) | `fast` (optimized production) | `profile`.
+- `WITH_MPI=1` — build the distributed-memory executables (`e4mpi`, `lmr-mpi-run`).
+- `WITH_COMPLEX_NUMBERS=1` / lmr's `lmrZ*` targets — build the complex-number version (see below).
+- `MULTI_SPECIES_GAS`, `MULTI_T_GAS`, `MHD`, `TURBULENCE`, `NK` — toggle physics modules in/out for smaller/faster builds. Default on.
+- `WITH_NK=1` (eilmer) — Newton-Krylov steady-state solver.
+
+## The `number` type abstraction (important)
+
+Physics/numerics code is written generically over the alias **`number`** (defined in `src/nm/number.d`):
+
+```d
+version(complex_numbers) { alias number = Complex!double; }
+else                     { alias number = double; }
+```
+
+The whole solver is compiled **twice**: a real-valued build for normal simulation, and a complex-valued build (`e4z*`, `lmrZ*`) used for **complex-step differentiation** to construct numerical Jacobians and design sensitivities (adjoint/shape optimization). When editing solver code, keep it valid for both: use `number` rather than `double` for flow quantities, and prefer functions that work under both versions. Many bugs surface only in the complex build, so unit tests run in both modes.
+
+## Testing
+
+**D unit tests** are embedded `unittest` blocks compiled into a test runner (`src/util/test_runner.d`). A library directory with a `test`/`test-real`/`test-complex` make target (e.g. `src/nm/`) runs them:
+
+```bash
+cd src/nm && make test          # runs both real and complex unit tests
+cd src/nm && make test-real     # real-valued only
+cd src/nm && make test-complex  # complex-valued only
+```
+
+`make demo` in library dirs builds small standalone demo programs.
+
+**Integration/regression tests** live alongside the examples and are driven by Ruby/Tcl/Python scripts:
+
+```bash
+cd examples/eilmer.test && ./eilmer-test.rb   # full suite (~1.5 h); needs ruby, python-sympy
+```
+Many example subdirectories contain `*-test.rb` / `test_*.rb` scripts that run a case and compare against golden results. Run them from a copy of the examples tree, not in-place (they generate output).
+
+## Typical lmr (Eilmer 5) simulation workflow
+
+```bash
+lmr prep-gas -i gas.lua -o gas.gas        # compile gas model
+lmr prep-reactions -g gas.gas -i chem.lua -o chem.chem
+lmr prep-grid                              # default job file: job.lua
+lmr prep-sim
+lmr run                                    # shared memory; mpirun -np N lmr-mpi-run for MPI
+lmr snapshot2vtk --add-vars="mach"         # post-process to VTK for ParaView
+```
+`lmr help -a` lists all subcommands. The Eilmer 4 equivalent is `e4shared --prep/--run/--post --job=<name>` after a standalone `prep-gas`.
+
+## Conventions
+
+- **Indentation:** 4 spaces for D, **3 spaces for Lua**; spaces not tabs (tab stops assumed every 8 columns). An `.editorconfig` is in `doc/editorconfig`.
+- **Commit messages** are prefixed with the affected area, e.g. `lmr: ...`, `gas: ...`, `examples/gas: ...`. A `doc/prepare-commit-msg` git hook can auto-suggest the prefix.
+- Run `make clean` before committing so build artifacts (`*.o`, executables, the vendored Lua build under `extern/lua-5.4.3/`) don't get added. Do not commit regenerable binaries.
+- History is kept close to linear; prefer small, single-issue commits and pull immediately before pushing.
+
+## MHD capability in lmr (Eilmer 5)
+
+There are **three separate "MHD" pathways** in `lmr`, with very different maturity. This matters because the current work (`gdtk-mhd` branch) does MHD via user-defined source terms, not the built-in MHD flag.
+
+### 1. UDF source terms — low-Rm / imposed-field MHD (recommended, no MHD flag needed)
+
+`getUDFSourceTermsForCell` (`src/lmr/user_defined_source_terms.d:25`) reads the Lua table returned by the user's `sourceTerms(t, cell)` function and adds it to the cell source vector via `add_udf_source_vector` → `Q.add(Qudf)` (`src/lmr/fluidfvcell.d:1296`). The generic fields `momentum_x/y/z`, `total_energy`, `mass`, `species`, `energies` are applied **regardless of compile flags** (`user_defined_source_terms.d:57-61`). This is the supported way to impose a Lorentz force **J×B** (momentum source) and Joule heating (energy source).
+
+What the UDF cell table exposes (`pushFluidCellToTable` → `pushFlowStateToTable`, `src/lmr/luawrap/luaflowstate.d:350`): position, `vol`, `p`, `T`, `rho`, `vel.x/y/z`, `a`, `mu`, `k`, `massf`, `T_modes`, and **`sigma`** (electrical conductivity, populated if a `conductivity_model` is set). The magnetic field `B`, `psi`, `divB` are exposed **only** under `version(MHD)` (`luaflowstate.d:384-388`); without the MHD build the user must supply **B** themselves in the UDF (the normal low-magnetic-Reynolds-number assumption).
+
+### 2. Electric-field Poisson solver (`src/lmr/efield/`) — always compiled, not behind `version(MHD)`
+
+Solves a Poisson equation for electric potential given a conductivity model, wired into the transient loop (`src/lmr/timemarching.d:444`). Enable via `config.solve_electric_field = true`, `config.electric_field_count = N`, `config.conductivity_model_name` (`test` | `constant` | `raizer` | `diffusion` | `none`, see `efieldconductivity.d:118`). Runnable example: `examples/lmr/2D/efield-solver/`. Use it to compute a self-consistent current distribution instead of prescribing **J**.
+
+### 3. Built-in single-fluid MHD (`version(MHD)`, default on via `MHD ?= 1`) — present but rough in lmr
+
+The Bond/Wheatley single-fluid model, ported from Eilmer 4 (README: "a work in progress"). It is wired through conserved quantities (adds `xB, yB, zB, psi, divB`, and forces z-momentum on in 2D — `conservedquantities.d:133-184`), config keys (`config.MHD`, `MHD_static_field`, `MHD_resistive`, `divergence_cleaning`, `c_h`, `divB_damping_length` — `lua-modules/globalconfig.lua:30`), HLLE flux + Dedner divergence cleaning (`fluxcalc.d:142`), and explicit-update divergence damping (`simcore_gasdynamic_step.d:1122`). **Caveats:**
+
+- **Transient explicit only.** The implicit / Newton-Krylov steady path has unfinished `// [TODO] PJ 2021-05-15 MHD bits` (`simcore_gasdynamic_step.d:2442`, `:2854`).
+- **No `lmr` examples.** All MHD examples ship under Eilmer 4 (`examples/eilmer/2D/mhd-blunt-nose`, `MHDShockTube`, `mhd-kelvin-helmholtz`); none under `examples/lmr/`, so the lmr MHD path is essentially untested by the suite.
+- **Known bug:** `fluxcalc.d:149` writes the z-field divergence-cleaning flux into `F[cqi.xB]` instead of `F[cqi.zB]` (double-hits `xB`, never sets `zB`).
+- Setting `config.MHD=true` without compiling `MHD=1` throws at runtime: *"MHD capability has not been enabled"* (`globalconfig.d:2071`).
+
+**Guidance:** prefer the UDF approach (pathway 1); keep `config.MHD` off and supply B in the UDF; optionally enable the efield solver (pathway 2) for a computed current. Treat the built-in MHD (pathway 3) as transient-only and unvalidated in lmr.
+
+## Documentation
+
+User guides (PDF/AsciiDoc) are under `doc/` (`lmr-reference-manual.adoc`, `geometry-reference-manual.adoc`, `nm-reference-manual.adoc`, etc.) and at <http://gdtk.uqcloud.net>. `doc/lmr-cheatsheet/` has a quick command reference. `doc/developer-notes.md` covers the git/dev workflow in detail.
