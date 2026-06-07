@@ -115,6 +115,63 @@ private:
     int electron_idx;
 }
 
+class CoulombConductivity : ConductivityModel{
+/*
+    Two-temperature partially-ionised electrical conductivity:
+        sigma = n_e e^2 / (m_e (nu_ea + nu_ei))
+    with electron-neutral (Frost/Phelps fit) and electron-ion (Coulomb) collision
+    frequencies, matching two_temperature_argon_kinetics.d. This is Coulomb-limited
+    (Spitzer-like) at high ionisation, unlike the weakly-ionised Raizer/BOLSIG forms
+    which omit electron-ion collisions. Evaluated in double precision (returns the
+    real conductivity), like the Raizer model.
+
+    @author: 2026
+*/
+    this(GasModel gm) {
+        if (!gm.is_plasma) throw new Error("CoulombConductivity model requires a GasModel with is_plasma=true");
+        nsp = gm.n_species;
+        number_density.length = nsp;
+        electron_idx = gm.species_index("e-");
+    }
+
+    @nogc final number opCall(ref const(GasState) gs, const Vector3 pos, GasModel gm){
+        gm.massf2numden(gs, number_density);
+        double n_e = (electron_idx >= 0) ? number_density[electron_idx].re : 0.0;
+        // Sum heavy-particle densities (everything except electrons) and subtract the
+        // ion density (= n_e by quasineutrality, single ionisation) to get neutrals.
+        // This avoids depending on gm.charge, which some gas models (e.g. the reacting
+        // argon model) do not populate.
+        immutable size_t e_idx = (electron_idx >= 0) ? cast(size_t) electron_idx : size_t.max;
+        double n_heavy = 0.0;
+        foreach(i; 0 .. nsp){ if (i != e_idx) n_heavy += number_density[i].re; }
+        n_e = fmax(n_e, 1.0e10);
+        double n_neutral = fmax(n_heavy - n_e, 1.0e16);
+        double Te = (gm.n_modes > 0) ? gs.T_modes[$-1].re : gs.T.re;
+        Te = fmax(3000.0, fmin(Te, 500.0e3));
+        // electron-neutral momentum-transfer cross-section [m^2] (Frost/Phelps fit)
+        double Q_ea;
+        if (Te < 10.0e3) {
+            Q_ea = 0.39 + Te*(-0.551e-4 + 0.595e-8*Te);
+        } else {
+            Q_ea = -0.35 + 0.775e-4*Te;
+        }
+        Q_ea *= 1.0e-20;
+        // electron-ion Coulomb cross-section [m^2] (n_e in cm^-3 inside the log)
+        double Q_ei = 1.95e-10/(Te*Te)*log(1.53e8*Te*Te*Te/(n_e/1.0e6));
+        if (Q_ei < 0.0) Q_ei = 0.0;
+        double v_th = sqrt(8.0*Boltzmann_constant*Te/(PI*_m_e));
+        double nu = fmax(n_neutral*v_th*Q_ea + n_e*v_th*Q_ei, 1.0e6);
+        double sigma = n_e*elementary_charge*elementary_charge/(_m_e*nu);
+        number result = sigma;
+        return result;
+    }
+private:
+    immutable double _m_e = 9.10938e-31; // electron mass [kg]
+    size_t nsp;
+    number[] number_density;
+    int electron_idx;
+}
+
 ConductivityModel create_conductivity_model(string name, GasModel gm){
     ConductivityModel conductivity_model;
     switch (name) {
@@ -129,6 +186,9 @@ ConductivityModel create_conductivity_model(string name, GasModel gm){
         break;
     case "diffusion":
         conductivity_model = new DiffusionConductivity(gm);
+        break;
+    case "coulomb":
+        conductivity_model = new CoulombConductivity(gm);
         break;
     case "none":
         break; //throw new Error("User has asked for solve_electric_field but failed to specify a conductivity model.");
