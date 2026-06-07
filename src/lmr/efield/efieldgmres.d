@@ -260,9 +260,13 @@ class GMResFieldSolver {
     
             //if ((k%nprint==0) && verbose) write(".");
             //writefln("iter: %d residual %e hkp1k %e", k, residual, hkp1k);
-            if (residual<tol) break;
+            // Relative convergence: ||dx|| measured relative to ||x|| (the +1.0 keeps
+            // it ~absolute for small-magnitude solutions, e.g. MES verification cases).
+            // The original absolute 1e-12 on ||dx|| is unmeetable for large-magnitude
+            // fields, such as the ~hundreds-of-volts field driven by the u x B source.
+            if (residual < tol*(vector_norm(xnew, matrix_size) + 1.0)) break;
         }
-        if (residual>=tol) success=false;
+        if (residual >= tol*(vector_norm(xnew, matrix_size) + 1.0)) success=false;
         if (verbose) writefln("    Solve Complete: status=%s  iters=%d/%d  residual=%e/%e", success, k, nmax_iter, residual, tol);
         if (success==false) throw new Error("BGMRes failed to converge!");
 
