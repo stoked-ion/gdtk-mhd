@@ -441,7 +441,7 @@ int integrateInTime(double targetTimeAsRequested)
                 chemistry_step(dt_chem);
             }
             // 2.5 Update electric field solution (if needed)
-            if (GlobalConfig.solve_electric_field && ((SimState.step+1)%GlobalConfig.electric_field_count==0)){
+            if (GlobalConfig.solve_electric_field && SimState.time >= GlobalConfig.electric_field_start_time && ((SimState.step+1)%GlobalConfig.electric_field_count==0)){
                 if (GlobalConfig.is_master_task) writeln("Called field.solve_efield(): ...");
                 eField.solve_efield(localFluidBlocks, GlobalConfig.is_master_task);
                 eField.compute_electric_field_vector(localFluidBlocks);
@@ -493,7 +493,7 @@ int integrateInTime(double targetTimeAsRequested)
                 chemistry_step(dt_chem);
             }
             // 2.5 Update electric field solution (if needed)
-            if (GlobalConfig.solve_electric_field && ((SimState.step+1)%GlobalConfig.electric_field_count==0)){
+            if (GlobalConfig.solve_electric_field && SimState.time >= GlobalConfig.electric_field_start_time && ((SimState.step+1)%GlobalConfig.electric_field_count==0)){
                 if (GlobalConfig.is_master_task) writeln("Called field.solve_efield(): ...");
                 eField.solve_efield(localFluidBlocks, GlobalConfig.is_master_task);
                 eField.compute_electric_field_vector(localFluidBlocks);
