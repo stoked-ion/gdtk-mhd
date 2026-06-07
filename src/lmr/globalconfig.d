@@ -1219,6 +1219,7 @@ final class GlobalConfig {
     // Activate the electric field solver by Nick Gibbons
     shared static int electric_field_count = 1000000000;
     shared static double electric_field_start_time = 0.0; // defer the field solve until this sim time
+    shared static double applied_Bz = 0.0; // uniform applied B (z) for the low-Rm efield uxB source
     shared static int electric_field_gmres_iters = -1;
     shared static bool solve_electric_field = false;
     shared static string conductivity_model_name = "none";
@@ -2077,6 +2078,7 @@ void set_config_for_core(JSONValue jsonData)
     mixin(update_double("divB_damping_length", "divB_damping_length"));
     mixin(update_int("electric_field_count", "electric_field_count"));
     mixin(update_double("electric_field_start_time", "electric_field_start_time"));
+    mixin(update_double("applied_Bz", "applied_Bz"));
     mixin(update_int("electric_field_gmres_iters", "electric_field_gmres_iters"));
     mixin(update_bool("solve_electric_field", "solve_electric_field"));
     mixin(update_string("conductivity_model_name", "conductivity_model_name"));

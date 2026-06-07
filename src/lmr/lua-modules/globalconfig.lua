@@ -35,6 +35,7 @@ configOptionsHidden = { -- hidden from user
    divB_damping_length = 1.0,
    electric_field_count = 1000000000,
    electric_field_start_time = 0.0,
+   applied_Bz = 0.0,
    electric_field_gmres_iters = -1,
    solve_electric_field = false,
    conductivity_model_name="none",

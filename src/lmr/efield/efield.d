@@ -292,6 +292,28 @@ class ElectricField {
                                                            + facy*(fdy[jo]));
                         }
                     }
+
+                    // u x B motional-EMF source (low magnetic Reynolds number):
+                    // charge continuity div(sigma(grad phi - uxB)) = 0 puts the
+                    // sigma (uxB).n flux on the RHS. Insulator (ZeroNormalGradient)
+                    // faces carry no current, so they get no source. B is the uniform
+                    // applied field (z). [TODO: an insulator BC should strictly enforce
+                    // grad(phi).n = (uxB).n; this is exact only where (uxB).n ~ 0, as at
+                    // the inflow/outflow boundaries of an axial-flow channel.]
+                    double Bz_app = GlobalConfig.applied_Bz;
+                    if (Bz_app != 0.0) {
+                        bool insulator = false;
+                        if (face.is_on_boundary) {
+                            auto fbc = field_bcs[blkid][face.bc_id];
+                            if ((cast(ZeroNormalGradient) fbc) !is null) insulator = true;
+                        }
+                        if (!insulator) {
+                            double uxf = face.fs.vel.x.re;
+                            double uyf = face.fs.vel.y.re;
+                            // (u x B) = (uy*Bz, -ux*Bz, 0); source = sigma (uxB . n_out) S
+                            b[k] += S * sigmaF * (uyf*Bz_app*nxF - uxf*Bz_app*nyF);
+                        }
+                    }
                 }
             }
         }
