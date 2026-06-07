@@ -393,6 +393,13 @@ void pushFluidCellToTable(lua_State* L, int tblIdx, ref const(FluidFVCell) cell,
     // when we sample the Fluid cell during the UDF evaluation for the corresponding solid cell.
     auto cqi = myConfig.cqi;
     lua_pushnumber(L, cell.Qudf[cqi.totEnergy]); lua_setfield(L, tblIdx, "Qudf_totEnergy");
+    // Expose the solved electric field (efield Poisson solver) to UDF source terms,
+    // so a UDF can form J = sigma*(E + uxB) and apply J x B / Joule heating itself.
+    // electric_field[] holds the cell-centre field components from solve_electric_field;
+    // they are zero if the field solver is not active.
+    lua_pushnumber(L, cell.electric_potential); lua_setfield(L, tblIdx, "phi");
+    lua_pushnumber(L, cell.electric_field[0]); lua_setfield(L, tblIdx, "Ex_solved");
+    lua_pushnumber(L, cell.electric_field[1]); lua_setfield(L, tblIdx, "Ey_solved");
 } // end pushFluidCellToTable()
 
 void pushFluidFaceToTable(lua_State* L, int tblIdx, ref const(FVInterface) face,
