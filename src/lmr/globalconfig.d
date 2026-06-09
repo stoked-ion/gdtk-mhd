@@ -1221,6 +1221,17 @@ final class GlobalConfig {
     shared static double electric_field_start_time = 0.0; // defer the field solve until this sim time
     shared static double applied_Bz = 0.0; // uniform applied B (z) for the low-Rm efield uxB source
     shared static int electric_field_gmres_iters = -1;
+    // Freeze the solved field through the Newton-Krylov linear solve: solve it at the
+    // base residual (ftl==0) and reuse it for the Frechet/Jacobian-vector evaluations
+    // (ftl!=0). Cuts the field solves per Newton step from ~max_linear_solver_iterations
+    // to ~1 (cheaper + less GC churn) at the cost of dropping the field-response term
+    // from the Jacobian (weaker for strongly-coupled / high-voltage cases). Default off
+    // = fully coupled (field re-solved on every residual evaluation).
+    shared static bool electric_field_freeze_in_linear_solve = false;
+    // Defer the (steady NK) field solve until this Newton step; 0 = from the first step.
+    // While deferred the field is left unsolved (NaN) so a NaN-aware UDF holds off the
+    // MHD forcing -- lets Phase 1 stabilise the pure flow before the coupled field/MHD.
+    shared static int electric_field_start_step = 0;
     shared static bool solve_electric_field = false;
     shared static string conductivity_model_name = "none";
 
@@ -2080,6 +2091,8 @@ void set_config_for_core(JSONValue jsonData)
     mixin(update_double("electric_field_start_time", "electric_field_start_time"));
     mixin(update_double("applied_Bz", "applied_Bz"));
     mixin(update_int("electric_field_gmres_iters", "electric_field_gmres_iters"));
+    mixin(update_bool("electric_field_freeze_in_linear_solve", "electric_field_freeze_in_linear_solve"));
+    mixin(update_int("electric_field_start_step", "electric_field_start_step"));
     mixin(update_bool("solve_electric_field", "solve_electric_field"));
     mixin(update_string("conductivity_model_name", "conductivity_model_name"));
 
@@ -2175,6 +2188,8 @@ void set_config_for_core(JSONValue jsonData)
         writeln("  divB_damping_length: ", cfg.divB_damping_length);
         writeln("  electric_field_count: ", cfg.electric_field_count);
         writeln("  electric_field_gmres_iters: ", cfg.electric_field_gmres_iters);
+        writeln("  electric_field_freeze_in_linear_solve: ", cfg.electric_field_freeze_in_linear_solve);
+        writeln("  electric_field_start_step: ", cfg.electric_field_start_step);
         writeln("  solve_electric_field: ", cfg.solve_electric_field);
         writeln("  conductivity_model_name: ", cfg.conductivity_model_name);
         writeln("  electric_field_work: ", cfg.electric_field_work);

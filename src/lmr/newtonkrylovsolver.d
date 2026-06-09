@@ -480,6 +480,9 @@ private:
  */
 
 static int fnCount = 0;
+// Current Newton step, mirrored from the main loop so the field-solve gates
+// (electric_field_start_step) can see it from evalResidualWorker/computePreconditioner.
+static int nkStep = 0;
 immutable double minScaleFactor = 1.0;
 immutable string refResidFname = "config/reference-residuals.saved";
 
@@ -1176,6 +1179,7 @@ void performNewtonKrylovUpdates(int snapshotStart, double startCFL, int maxCPUs,
          *    e. set flag on preconditioner
          */
         residualsUpToDate = false;
+        nkStep = step; // mirror for the field-solve deferral gate (electric_field_start_step)
         // 0a. change of phase
         stepsIntoCurrentPhase++;
         startOfNewPhase = false;
@@ -2531,7 +2535,7 @@ void computePreconditioner()
 {
     size_t nConserved = GlobalConfig.cqi.n;
 
-    if (GlobalConfig.solve_electric_field){
+    if (GlobalConfig.solve_electric_field && nkStep >= GlobalConfig.electric_field_start_step){
         eField.solve_efield(localFluidBlocks, false);
         eField.compute_electric_field_vector(localFluidBlocks);
         foreach (blk; parallel(localFluidBlocks, 1)) {
@@ -3474,7 +3478,14 @@ void evalResidualWorker(int ftl)
         // ghost cells along block-block boundaries have the most
         // recent mu_t and k_t values.
         exchange_ghost_cell_turbulent_viscosity();
-        if (GlobalConfig.solve_electric_field) {
+        // Solve the electric field for this residual evaluation, unless:
+        //  - deferred: nkStep < electric_field_start_step (field left unsolved so a
+        //    NaN-aware UDF holds off the MHD forcing during the early/Phase-1 steps), or
+        //  - frozen: electric_field_freeze_in_linear_solve and this is a Frechet/
+        //    Jacobian-vector evaluation (ftl != 0) -- reuse the base (ftl==0) field.
+        if (GlobalConfig.solve_electric_field
+            && nkStep >= GlobalConfig.electric_field_start_step
+            && !(GlobalConfig.electric_field_freeze_in_linear_solve && ftl != 0)) {
             eField.solve_efield(localFluidBlocks, false);
             eField.compute_electric_field_vector(localFluidBlocks);
             foreach (blk; parallel(localFluidBlocks, 1)) {
