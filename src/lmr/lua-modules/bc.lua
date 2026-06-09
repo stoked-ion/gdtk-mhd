@@ -630,6 +630,26 @@ function MixedField:tojson()
    return str
 end
 
+-- Electrode sheath BC (Phase 1: linear sheath resistance + constant fall). Inserts a
+-- physical sheath impedance Rsheath [Ohm.m^2] between the electrode metal (Velectrode)
+-- and the plasma edge, so the applied voltage couples to the bulk instead of being
+-- absorbed by the cold-electrode sigma collapse. Vfall is a constant electrode-fall
+-- offset (Veff = Velectrode - Vfall). Rsheath -> 0 = hard Dirichlet; Rsheath -> inf = open.
+SheathField = FieldBoundary:new{Velectrode=0.0, Rsheath=1.0, Vfall=0.0}
+SheathField.name = "SheathField"
+function SheathField:new(o)
+   o = FieldBoundary.new(self, o)
+   return o
+end
+function SheathField:tojson()
+   local str = string.format(' {"name": "%s", ', self.name)
+   str = str .. string.format('"Velectrode": %.18e, ', self.Velectrode)
+   str = str .. string.format('"Rsheath": %.18e, ', self.Rsheath)
+   str = str .. string.format('"Vfall": %.18e', self.Vfall)
+   str = str .. '}'
+   return str
+end
+
 FixedGradient_Test = FieldBoundary:new()
 FixedGradient_Test.name = "FixedGradient_Test"
 function FixedGradient_Test:new(o)

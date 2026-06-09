@@ -93,6 +93,58 @@ private:
     double value;
 }
 
+class SheathField : FieldBC {
+/*
+    Electrode sheath boundary condition (linear / constant-fall; Phase 1).
+
+    Motivation: the cold electrode face has Raizer sigma = 8300*exp(-36000/Te) ~ 0,
+    because the no-slip fixed-T wall forces Te = Twall (~300 K) at the face. A FixedField
+    (Dirichlet) BC's matrix weight is proportional to that face sigma, so it collapses to
+    ~0 and the applied electrode voltage has no effect -- the device sits at open circuit
+    regardless of voltage. This BC instead inserts a physical sheath impedance in series
+    between the electrode metal (potential Velectrode) and the plasma edge (boundary cell):
+
+        J.n_out = (phi_cell - Veff) / Rsheath,     Veff = Velectrode - Vfall
+
+    a Robin condition whose matrix weight is the sheath conductance S/Rsheath (NOT the
+    collapsed gas sigma), so the voltage couples to the bulk. The gas-conduction stencil
+    at this face is suppressed (the face is treated like ZeroNormalGradient in efield.d's
+    assembly and field-vector reconstruction); only this sheath current crosses the
+    boundary. Limits: Rsheath -> 0 recovers a hard Dirichlet (FixedField, strong coupling);
+    Rsheath -> inf recovers open circuit (insulator). Vfall is a constant electrode-fall
+    offset (a linear proxy; the switching-diode / Child-Langmuir / thermionic laws are
+    Phase 2).
+*/
+    this(double Velectrode, double Rsheath, double Vfall) {
+        this.Velectrode = Velectrode;
+        this.Rsheath = (Rsheath > 0.0) ? Rsheath : 1.0e-30; // guard against divide-by-zero
+        this.Vfall = Vfall;
+        this.Veff = Velectrode - Vfall;
+    }
+
+    final bool isShared() const { return false; }
+    final Vector3 other_pos(const FVInterface face) {return face.pos;}
+    final int other_id(const FVInterface face) {return -1;}
+    final double phif(const FVInterface face) { return 0.0; } // gas gradient is ZNG-like here
+    // Robin sheath term: conductance (S/Rsheath) connecting phi_cell to Veff. Note these
+    // are NOT scaled by the (collapsed) gas face sigma -- that is the whole point.
+    final double lhs_direct_component(double fac, const FVInterface face){ return -1.0*face.length.re/Rsheath; }
+    final double lhs_other_component(double fac, const FVInterface face){ return 0.0; }
+    final double rhs_direct_component(double sign, double fac, const FVInterface face){ return face.length.re/Rsheath*Veff; }
+    final double rhs_stencil_component(double D, double facx, double facy, double fdx, double fdy, FVInterface jface){ return 0.0; }
+    final double lhs_stencil_component(double D, double facx, double facy, double fdx, double fdy, FVInterface jface){ return 0.0; }
+    final double compute_current(const double sign, const FVInterface face, const FluidFVCell cell){
+        double S = face.length.re;
+        double I = (Veff - cell.electric_potential)/Rsheath*S; // current from electrode into domain
+        return I;
+    }
+    override string toString() const {
+        return format("SheathField(Velectrode=%g, Rsheath=%g, Vfall=%g)", Velectrode, Rsheath, Vfall);
+    }
+private:
+    double Velectrode, Rsheath, Vfall, Veff;
+}
+
 class MixedField : FieldBC {
     this(double differential, double xinsulator, double xcollector) {
         this.nose = new FixedField(1.0);
@@ -412,6 +464,12 @@ FieldBC create_field_bc(JSONValue field_bc_json, const BoundaryCondition bc, con
     case "FixedField":
         double value = getJSONdouble(field_bc_json, "value", 0.0);
         field_bc = new FixedField(value);
+        break;
+    case "SheathField":
+        double Velectrode = getJSONdouble(field_bc_json, "Velectrode", 0.0);
+        double Rsheath = getJSONdouble(field_bc_json, "Rsheath", 1.0);
+        double Vfall = getJSONdouble(field_bc_json, "Vfall", 0.0);
+        field_bc = new SheathField(Velectrode, Rsheath, Vfall);
         break;
     case "MixedField":
         double differential = getJSONdouble(field_bc_json, "differential", 1.0);

@@ -140,6 +140,12 @@ class ElectricField {
                 foreach(io, face; cell.iface){
 					if (face.is_on_boundary) {
 						auto field_bc = field_bcs[blkid][face.bc_id];
+						// NOTE: SheathField is deliberately NOT folded into the ZNG celltype
+						// here. Doing so makes electrode/inflow corner cells have two ZNG-type
+						// faces, an unhandled combined celltype. The sheath face's gas-gradient
+						// contribution is already suppressed in the matrix assembly (facx=facy
+						// =fac=0), and the electrode cell is UDF-guarded, so the R-formula
+						// reconstruction there is harmless.
 						if ((cast(ZeroNormalGradient) field_bc) !is null) {
                             celltype = celltype | ZNG_types[io];
 						}
@@ -266,6 +272,16 @@ class ElectricField {
                             facx = nxF;
                             facy = nyF;
                             fac = 0.0;
+                        } else if ((cast(SheathField) field_bc) !is null){
+                            // Electrode sheath: the gas carries ~no current at the cold
+                            // electrode face (face sigma ~ 0), so suppress its gas-conduction
+                            // stencil (facx=facy=fac=0). The electrode current is instead the
+                            // sheath Robin term (conductance S/Rsheath, NOT gas sigma):
+                            facx = 0.0;
+                            facy = 0.0;
+                            fac = 0.0;
+                            A[k*nbands + 2]  += field_bc.lhs_direct_component(fac, face);
+                            b[k]             -= field_bc.rhs_direct_component(sign, fac, face);
                         } else {
                             A[k*nbands + 2]  += field_bc.lhs_direct_component(fac, face);
                             A[k*nbands + iio]+= field_bc.lhs_other_component(fac, face);
@@ -305,7 +321,8 @@ class ElectricField {
                         bool insulator = false;
                         if (face.is_on_boundary) {
                             auto fbc = field_bcs[blkid][face.bc_id];
-                            if ((cast(ZeroNormalGradient) fbc) !is null) insulator = true;
+                            if (((cast(ZeroNormalGradient) fbc) !is null) ||
+                                ((cast(SheathField) fbc) !is null)) insulator = true;
                         }
                         if (!insulator) {
                             double uxf = face.fs.vel.x.re;
@@ -430,6 +447,12 @@ class ElectricField {
                 foreach(io, face; cell.iface){
 					if (face.is_on_boundary) {
 						auto field_bc = field_bcs[blkid][face.bc_id];
+						// NOTE: SheathField is deliberately NOT folded into the ZNG celltype
+						// here. Doing so makes electrode/inflow corner cells have two ZNG-type
+						// faces, an unhandled combined celltype. The sheath face's gas-gradient
+						// contribution is already suppressed in the matrix assembly (facx=facy
+						// =fac=0), and the electrode cell is UDF-guarded, so the R-formula
+						// reconstruction there is harmless.
 						if ((cast(ZeroNormalGradient) field_bc) !is null) {
                             celltype = celltype | ZNG_types[io];
 						}
