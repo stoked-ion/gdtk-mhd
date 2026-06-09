@@ -15,6 +15,7 @@ version(mpi_parallel){
 }
 
 import geom;
+import nm.smla : SMatrix, decompILU0, iluApply = solve;
 
 import lmr.efield.efieldbc;
 import lmr.efield.efieldexchange;
@@ -28,6 +29,65 @@ class GMResFieldSolver {
             this.exchanger = exchanger;
         }
     }
+
+    // ILU(0) preconditioner (per-rank; block-Jacobi across MPI ranks). The sparsity
+    // structure is fixed (grid + 5-band stencil), and ILU(0) introduces no fill-in,
+    // so we build the SMatrix ONCE and on later solves just refill its values and
+    // re-factor in place. This avoids allocating a fresh SMatrix (+ per-row dup arrays)
+    // on every solve, which under the steady NK loop's ~60 solves/step generated GC
+    // garbage faster than the conservative collector reclaimed it (RSS creep -> OOM).
+    private SMatrix!double Mfact;
+    private bool use_ilu = false;
+    private bool ilu_built = false;
+
+    void build_ilu_preconditioner(int n, int nb, double[] A, int[] Ai){
+        if (!ilu_built) {
+            Mfact = new SMatrix!double();
+            foreach(i; 0 .. n){
+                size_t[5] cols; double[5] vals; int cnt = 0;
+                foreach(j; 0 .. nb){
+                    int jj = Ai[i*nb + j];
+                    if (jj < 0 || jj >= n) continue; // drop empty + external/MPI columns
+                    cols[cnt] = cast(size_t) jj; vals[cnt] = A[i*nb + j]; cnt++;
+                }
+                // CSR requires ascending column order within a row; insertion sort.
+                for (int a=1; a<cnt; a++){
+                    size_t cv = cols[a]; double vv = vals[a]; int b = a-1;
+                    while (b >= 0 && cols[b] > cv){ cols[b+1]=cols[b]; vals[b+1]=vals[b]; b--; }
+                    cols[b+1]=cv; vals[b+1]=vv;
+                }
+                Mfact.addRow(vals[0..cnt].dup, cols[0..cnt].dup);
+            }
+            ilu_built = true;
+        } else {
+            // Refill values into the cached structure (identical column order to the
+            // build above, since Ai is constant), overwriting the previous factors.
+            size_t pos = 0;
+            foreach(i; 0 .. n){
+                size_t[5] cols; double[5] vals; int cnt = 0;
+                foreach(j; 0 .. nb){
+                    int jj = Ai[i*nb + j];
+                    if (jj < 0 || jj >= n) continue;
+                    cols[cnt] = cast(size_t) jj; vals[cnt] = A[i*nb + j]; cnt++;
+                }
+                for (int a=1; a<cnt; a++){
+                    size_t cv = cols[a]; double vv = vals[a]; int b = a-1;
+                    while (b >= 0 && cols[b] > cv){ cols[b+1]=cols[b]; vals[b+1]=vals[b]; b--; }
+                    cols[b+1]=cv; vals[b+1]=vv;
+                }
+                foreach(k; 0 .. cnt){ Mfact.aa[pos] = vals[k]; pos++; }
+            }
+        }
+        decompILU0!double(Mfact);
+        use_ilu = true;
+    }
+
+    // Reusable GMRES work buffers (allocated once, sized by nmax_iter x matrix_size,
+    // then reused every solve). Members rather than per-call locals to eliminate the
+    // ~40 MB/solve allocation churn (q alone is nmax_iter*matrix_size doubles).
+    private double[] r, q, y, xold, xnew, xdiff, h, c, s, QT, R, B, Y;
+    private bool work_allocated = false;
+    private int work_nmax_iter = -1, work_msize = -1;
 
     void givens_rotation_cs(int i, int j, int n, double[] h, ref double c, ref double s){
         double a = h[j*n + j];
@@ -150,29 +210,31 @@ class GMResFieldSolver {
     
             @author: Nick Gibbons
         */
-        double[] r;
-        r.length = matrix_size;
+        // Allocate the reusable work buffers once (sizes are constant across solves).
+        // On subsequent solves these are reused as-is; the per-solve resets below
+        // (QT, R, xold, q) re-initialise what the algorithm reads, and h/c/s/y/xnew/
+        // xdiff/B/Y are written before they are read each iteration.
+        if (!work_allocated || work_nmax_iter != nmax_iter || work_msize != matrix_size) {
+            r.length    = matrix_size;
+            q.length    = nmax_iter*matrix_size;
+            y.length    = matrix_size;
+            xold.length = matrix_size;
+            xnew.length = matrix_size;
+            xdiff.length= matrix_size;
+            h.length    = (nmax_iter+1)*nmax_iter;
+            c.length    = nmax_iter;
+            s.length    = nmax_iter;
+            QT.length   = (nmax_iter+1)*(nmax_iter+1);
+            R.length    = (nmax_iter+1)*nmax_iter;
+            B.length    = nmax_iter+1;
+            Y.length    = nmax_iter+1;
+            work_allocated = true; work_nmax_iter = nmax_iter; work_msize = matrix_size;
+        }
         banded_matrix_vector_product(matrix_size, nbands, A, Ai, x0, r);
         foreach(i; 0 .. matrix_size) r[i] = b[i] - r[i];
+        if (use_ilu) iluApply(Mfact, r);   // left preconditioning: r <- M^{-1} r
         double rnorm = vector_norm(r, matrix_size);
-    
-        double[] q,y,xold,xnew,xdiff,h,c,s,QT,R,B,Y;
-    
-        // Memory allocation 👀
-        q.length   = nmax_iter*matrix_size;
-        y.length   = matrix_size;
-        xold.length= matrix_size;
-        xnew.length= matrix_size;
-        xdiff.length= matrix_size;
 
-        h.length   = (nmax_iter+1)*nmax_iter;
-        c.length   = nmax_iter;
-        s.length   = nmax_iter;
-        QT.length  = (nmax_iter+1)*(nmax_iter+1);
-        R.length   = (nmax_iter+1)*nmax_iter;
-        B.length   = nmax_iter+1;
-        Y.length   = nmax_iter+1;
-    
         QT[] = 0.0;
         foreach(i; 0 .. nmax_iter+1) QT[i*(nmax_iter+1)+i] = 1.0;
         R[] = 0.0;
@@ -191,6 +253,7 @@ class GMResFieldSolver {
             // Perform Arnoldi Iteration to generate basis vectors
             double[] qk = q[k*matrix_size .. (k+1)*matrix_size];
             banded_matrix_vector_product(matrix_size, nbands, A, Ai, qk, y);
+            if (use_ilu) iluApply(Mfact, y);   // left preconditioning: y <- M^{-1} (A qk)
 
             //writeln("qk");
             //writeln(q[k*matrix_size .. (k+1)*matrix_size]);

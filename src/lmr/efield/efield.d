@@ -331,6 +331,11 @@ class ElectricField {
             }
         }
 
+        // ILU(0) preconditioner (block-Jacobi across MPI ranks), built from the
+        // Jacobi-scaled banded matrix so the diagonal is ~1 for stable pivots.
+        // Far stronger than point-Jacobi alone for the variable-conductivity Poisson.
+        gmres.build_ilu_preconditioner(N, nbands, A, Ai);
+
         phi0[] = 0.0;
         gmres.solve(N, nbands, A, Ai, b, phi0, phi, max_iter, verbose);
 
