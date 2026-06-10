@@ -630,12 +630,18 @@ function MixedField:tojson()
    return str
 end
 
--- Electrode sheath BC (Phase 1: linear sheath resistance + constant fall). Inserts a
--- physical sheath impedance Rsheath [Ohm.m^2] between the electrode metal (Velectrode)
--- and the plasma edge, so the applied voltage couples to the bulk instead of being
--- absorbed by the cold-electrode sigma collapse. Vfall is a constant electrode-fall
--- offset (Veff = Velectrode - Vfall). Rsheath -> 0 = hard Dirichlet; Rsheath -> inf = open.
-SheathField = FieldBoundary:new{Velectrode=0.0, Rsheath=1.0, Vfall=0.0}
+-- Electrode sheath BC. Inserts a physical sheath impedance between the electrode metal
+-- (Velectrode) and the plasma edge, so the applied voltage couples to the bulk instead
+-- of being absorbed by the cold-electrode sigma collapse. The current-voltage law is the
+-- pluggable sheath_model:
+--   "linear"         J = (dV - Vfall)/Rsheath                 [Rsheath, Vfall]
+--   "diode"          conducts only for |dV| > Vfall           [Rsheath, Vfall, leak]
+--   "child-langmuir" J = K*|dV|^1.5 (space-charge-limited)    [K, leak]
+--   "saturation"     resistive, capped at the electron sat.   [Rsheath, Vfall, leak]
+-- with dV = phi_edge - Velectrode. All param fields are emitted; the chosen model reads
+-- the ones it needs. Defaults reproduce the Phase-1 linear sheath.
+SheathField = FieldBoundary:new{Velectrode=0.0, sheath_model="linear",
+                                Rsheath=1.0, Vfall=0.0, K=1.0e-3, leak=1.0e-6}
 SheathField.name = "SheathField"
 function SheathField:new(o)
    o = FieldBoundary.new(self, o)
@@ -644,8 +650,11 @@ end
 function SheathField:tojson()
    local str = string.format(' {"name": "%s", ', self.name)
    str = str .. string.format('"Velectrode": %.18e, ', self.Velectrode)
+   str = str .. string.format('"sheath_model": "%s", ', self.sheath_model)
    str = str .. string.format('"Rsheath": %.18e, ', self.Rsheath)
-   str = str .. string.format('"Vfall": %.18e', self.Vfall)
+   str = str .. string.format('"Vfall": %.18e, ', self.Vfall)
+   str = str .. string.format('"K": %.18e, ', self.K)
+   str = str .. string.format('"leak": %.18e', self.leak)
    str = str .. '}'
    return str
 end

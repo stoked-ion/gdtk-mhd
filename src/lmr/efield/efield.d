@@ -272,16 +272,19 @@ class ElectricField {
                             facx = nxF;
                             facy = nyF;
                             fac = 0.0;
-                        } else if ((cast(SheathField) field_bc) !is null){
+                        } else if (auto sheath = cast(SheathField) field_bc){
                             // Electrode sheath: the gas carries ~no current at the cold
                             // electrode face (face sigma ~ 0), so suppress its gas-conduction
-                            // stencil (facx=facy=fac=0). The electrode current is instead the
-                            // sheath Robin term (conductance S/Rsheath, NOT gas sigma):
+                            // stencil (facx=facy=fac=0). The electrode current is the sheath
+                            // Robin term from the pluggable SheathModel, linearized about the
+                            // current plasma-edge potential (NOT scaled by gas sigma).
                             facx = 0.0;
                             facy = 0.0;
                             fac = 0.0;
-                            A[k*nbands + 2]  += field_bc.lhs_direct_component(fac, face);
-                            b[k]             -= field_bc.rhs_direct_component(sign, fac, face);
+                            double a_diag, b_rhs;
+                            sheath.linearized_robin(face, cell.electric_potential.re, gmodel, a_diag, b_rhs);
+                            A[k*nbands + 2] += a_diag;
+                            b[k]            += b_rhs;
                         } else {
                             A[k*nbands + 2]  += field_bc.lhs_direct_component(fac, face);
                             A[k*nbands + iio]+= field_bc.lhs_other_component(fac, face);

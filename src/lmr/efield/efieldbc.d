@@ -17,9 +17,13 @@ import geom;
 import nm.number;
 import util.json_helper;
 
+import gas.gas_model;
+
 import lmr.bc.boundary_condition;
 import lmr.bc.ghost_cell_effect.full_face_copy;
 import lmr.efield.efieldconductivity;
+import lmr.efield.efieldsheath;
+import lmr.globalconfig;
 import lmr.fluidfvcell;
 import lmr.fvinterface;
 
@@ -95,54 +99,71 @@ private:
 
 class SheathField : FieldBC {
 /*
-    Electrode sheath boundary condition (linear / constant-fall; Phase 1).
+    Electrode sheath boundary condition (Phase 2: pluggable SheathModel).
 
     Motivation: the cold electrode face has Raizer sigma = 8300*exp(-36000/Te) ~ 0,
     because the no-slip fixed-T wall forces Te = Twall (~300 K) at the face. A FixedField
     (Dirichlet) BC's matrix weight is proportional to that face sigma, so it collapses to
     ~0 and the applied electrode voltage has no effect -- the device sits at open circuit
     regardless of voltage. This BC instead inserts a physical sheath impedance in series
-    between the electrode metal (potential Velectrode) and the plasma edge (boundary cell):
+    between the electrode metal (potential Velectrode) and the plasma edge (boundary cell).
 
-        J.n_out = (phi_cell - Veff) / Rsheath,     Veff = Velectrode - Vfall
-
-    a Robin condition whose matrix weight is the sheath conductance S/Rsheath (NOT the
-    collapsed gas sigma), so the voltage couples to the bulk. The gas-conduction stencil
-    at this face is suppressed (the face is treated like ZeroNormalGradient in efield.d's
-    assembly and field-vector reconstruction); only this sheath current crosses the
-    boundary. Limits: Rsheath -> 0 recovers a hard Dirichlet (FixedField, strong coupling);
-    Rsheath -> inf recovers open circuit (insulator). Vfall is a constant electrode-fall
-    offset (a linear proxy; the switching-diode / Child-Langmuir / thermionic laws are
-    Phase 2).
+    The sheath current-voltage law J(dV), dV = phi_cell - Velectrode, is a pluggable
+    SheathModel (efieldsheath.d: linear | diode | child-langmuir | saturation). The Robin
+    term it produces is assembled directly in efield.d via linearized_robin(): the model
+    is linearized locally around the current plasma-edge potential each solve and the
+    nonlinearity is converged by the Newton-Krylov outer loop. The matrix weight is the
+    sheath's differential conductance dJ/d(dV), NOT the collapsed cold-face gas sigma --
+    so the applied voltage couples to the bulk. The gas-conduction stencil at this face
+    is suppressed (treated like ZeroNormalGradient in efield.d's assembly). For a linear
+    model, Rsheath -> 0 recovers a hard Dirichlet (FixedField); Rsheath -> inf recovers
+    open circuit (insulator).
 */
-    this(double Velectrode, double Rsheath, double Vfall) {
+    this(double Velectrode, SheathModel model) {
         this.Velectrode = Velectrode;
-        this.Rsheath = (Rsheath > 0.0) ? Rsheath : 1.0e-30; // guard against divide-by-zero
-        this.Vfall = Vfall;
-        this.Veff = Velectrode - Vfall;
+        this.model = model;
     }
 
     final bool isShared() const { return false; }
     final Vector3 other_pos(const FVInterface face) {return face.pos;}
     final int other_id(const FVInterface face) {return -1;}
     final double phif(const FVInterface face) { return 0.0; } // gas gradient is ZNG-like here
-    // Robin sheath term: conductance (S/Rsheath) connecting phi_cell to Veff. Note these
-    // are NOT scaled by the (collapsed) gas face sigma -- that is the whole point.
-    final double lhs_direct_component(double fac, const FVInterface face){ return -1.0*face.length.re/Rsheath; }
+    // The sheath Robin term is assembled in efield.d via linearized_robin(); these
+    // FieldBC interface stubs are unused for SheathField (the assembly handles it).
+    final double lhs_direct_component(double fac, const FVInterface face){ return 0.0; }
     final double lhs_other_component(double fac, const FVInterface face){ return 0.0; }
-    final double rhs_direct_component(double sign, double fac, const FVInterface face){ return face.length.re/Rsheath*Veff; }
+    final double rhs_direct_component(double sign, double fac, const FVInterface face){ return 0.0; }
     final double rhs_stencil_component(double D, double facx, double facy, double fdx, double fdy, FVInterface jface){ return 0.0; }
     final double lhs_stencil_component(double D, double facx, double facy, double fdx, double fdy, FVInterface jface){ return 0.0; }
     final double compute_current(const double sign, const FVInterface face, const FluidFVCell cell){
         double S = face.length.re;
-        double I = (Veff - cell.electric_potential)/Rsheath*S; // current from electrode into domain
-        return I;
+        double dV = cell.electric_potential.re - Velectrode;
+        return model.current(dV, face.fs.gas, GlobalConfig.gmodel_master)*S; // sheath current out into electrode
+    }
+
+    // Linearized Robin contribution for the boundary cell's charge balance, assembled in
+    // efield.d. dV = phi_cell - Velectrode; linearize J(dV) about the current phi_cell:
+    //   I_into_cell = -S*J(dV) ~= -S*Jp*phi_cell + S*(Jp*phi_cell - J0)
+    // giving A[diag] += a_diag, b[k] += b_rhs with:
+    void linearized_robin(const FVInterface face, double phi_cell, GasModel gm, out double a_diag, out double b_rhs){
+        double S = face.length.re;
+        // NaN guard: cell.electric_potential is NaN before the first solve. A nonlinear
+        // model linearized about NaN gives a NaN matrix that never recovers (the linear
+        // model is immune because phi_cell cancels). Seed the first linearization with
+        // dV0 = 0 (phi_cell = Velectrode) so it starts finite; later solves use the real phi.
+        if (phi_cell != phi_cell) phi_cell = Velectrode;
+        double dV0 = phi_cell - Velectrode;
+        double J0 = model.current(dV0, face.fs.gas, gm);
+        double Jp = model.conductance(dV0, face.fs.gas, gm);
+        a_diag = -S*Jp;
+        b_rhs  = S*(J0 - Jp*phi_cell);
     }
     override string toString() const {
-        return format("SheathField(Velectrode=%g, Rsheath=%g, Vfall=%g)", Velectrode, Rsheath, Vfall);
+        return format("SheathField(Velectrode=%g)", Velectrode);
     }
 private:
-    double Velectrode, Rsheath, Vfall, Veff;
+    double Velectrode;
+    SheathModel model;
 }
 
 class MixedField : FieldBC {
@@ -467,9 +488,8 @@ FieldBC create_field_bc(JSONValue field_bc_json, const BoundaryCondition bc, con
         break;
     case "SheathField":
         double Velectrode = getJSONdouble(field_bc_json, "Velectrode", 0.0);
-        double Rsheath = getJSONdouble(field_bc_json, "Rsheath", 1.0);
-        double Vfall = getJSONdouble(field_bc_json, "Vfall", 0.0);
-        field_bc = new SheathField(Velectrode, Rsheath, Vfall);
+        string sheath_model = getJSONstring(field_bc_json, "sheath_model", "linear");
+        field_bc = new SheathField(Velectrode, create_sheath_model(sheath_model, field_bc_json));
         break;
     case "MixedField":
         double differential = getJSONdouble(field_bc_json, "differential", 1.0);

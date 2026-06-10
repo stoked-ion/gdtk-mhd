@@ -98,6 +98,7 @@ LMR_EFIELD_FILES := $(LMR)/efield/efield.d \
 	$(LMR)/efield/efieldconductivity.d \
 	$(LMR)/efield/efieldexchange.d \
 	$(LMR)/efield/efieldderivatives.d \
+	$(LMR)/efield/efieldsheath.d \
 	$(LMR)/efield/efieldbc.d
 
 LMR_LUA_FILES = $(LMR_LUA_WRAP)/luaflowsolution.d \
