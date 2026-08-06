@@ -40,6 +40,7 @@ import util.lua;
 import util.lua_service;
 import util.time_utils : timeStringToSeconds;
 
+import lmr.flowsolution;
 import lmr.special_block_init;
 import lmr.bc;
 import lmr.blockio;
@@ -73,7 +74,7 @@ import lmr.grid_motion;
 import lmr.grid_motion_udf;
 import lmr.grid_motion_shock_fitting;
 import lmr.lmrwarnings;
-import lmr.dualtimestepping: addUnsteadyTermToResiduals;
+import lmr.dualtimestepping: addUnsteadyTermToResidualVector;
 
 version(mpi_parallel) {
     import mpi;
@@ -640,10 +641,10 @@ LinearSystemInput lsi;
 
 struct GMRESInfo {
     int nRestarts;
-    double initResidual;
-    double finalResidual;
+    double initResidual = 1.0;
+    double finalResidual = 1.0;
     int iterationCount;
-    double linearSolveWallTime;
+    double linearSolveWallTime = 0.0;
     double pcWallTime = 0.0 ; // initialize to 0.0 to handle cases where FGMRES never invokes the preconditioner
 };
 GMRESInfo gmresInfo;
@@ -718,6 +719,8 @@ void initNewtonKrylovSimulation(int snapshotStart, int maxCPUs, int threadsPerMP
     if ((cfg.interpolation_order > 1) &&
         ((cfg.unstructured_limiter == UnstructuredLimiter.hvenkat) ||
          (cfg.unstructured_limiter == UnstructuredLimiter.venkat) ||
+         (cfg.unstructured_limiter == UnstructuredLimiter.hvenkat2) ||
+         (cfg.unstructured_limiter == UnstructuredLimiter.venkat2) ||
          (cfg.unstructured_limiter == UnstructuredLimiter.hvenkat_mlp) ||
          (cfg.unstructured_limiter == UnstructuredLimiter.venkat_mlp))) {
         initUSGlimiters();
@@ -1037,6 +1040,18 @@ void performNewtonKrylovUpdates(int snapshotStart, double startCFL, int maxCPUs,
         prevGlobalResidual = restart.prevGlobalResidual;
         currentPhase = restart.phase;
         stepsIntoCurrentPhase = restart.stepsIntoPhase;
+        // When restarting from a phase with frozen limiter and/or shock detector values,
+        // set the frozen-value flags before setPhaseSettings(), so its residual
+        // evaluation does not overwrite values restored from the snapshot.
+        if (nkPhases[currentPhase].frozenLimiterForResidual && cfg.interpolation_order > 1) {
+            // Limiter values may exist in the snapshot directory but are not read by the flow solution.
+            bool limiterValuesLoaded = readLimiterValues(snapshotStart);
+            if (limiterValuesLoaded) { cfg.frozen_limiter = true; }
+        }
+        if (nkPhases[currentPhase].frozenShockDetector) {
+            // Shock detector values were read by the flow solution in the snapshot directory.
+            cfg.frozen_shock_detector = true;
+        }
         setPhaseSettings(currentPhase);
         if (activePhase.useAutoCFL) {
             cflSelector = new ResidualBasedAutoCFL(activePhase.autoCFLExponent, activePhase.maxCFL,
@@ -1084,6 +1099,19 @@ void performNewtonKrylovUpdates(int snapshotStart, double startCFL, int maxCPUs,
             initialiseDiagnosticsFile();
         }
         // On fresh start, the phase setting must be at 0
+        //
+        // Support advanced users who may warm-start a simulation from a previous
+        // solution with shock detector values already present, or manually copy frozen
+        // limiter values into the 0000 snapshot directory before starting a new simulation.
+        if (nkPhases[0].frozenLimiterForResidual && cfg.interpolation_order > 1) {
+            // Limiter values may exist in the snapshot directory but are not read by the flow solution.
+            bool limiterValuesLoaded = readLimiterValues(snapshotStart);
+            if (limiterValuesLoaded) { cfg.frozen_limiter = true; }
+        }
+        if (nkPhases[0].frozenShockDetector) {
+            // Shock detector values were read by the flow solution in the snapshot directory.
+            cfg.frozen_shock_detector = true;
+        }
         setPhaseSettings(0);
         if (activePhase.useAutoCFL) {
             cflSelector = new ResidualBasedAutoCFL(activePhase.autoCFLExponent, activePhase.maxCFL,
@@ -1112,10 +1140,10 @@ void performNewtonKrylovUpdates(int snapshotStart, double startCFL, int maxCPUs,
 
         // On fresh start, may need to set reference residuals based on initial condition.
         evalResidual(0, currentPhase, stepsIntoCurrentPhase);
-        setResiduals();
+        fillResidualVector();
         computeGlobalResidual();
         referenceGlobalResidual = globalResidual;
-        computeResiduals(referenceResiduals);
+        computeMaxResiduals(referenceResiduals);
         // Add value of 1.0 to each residaul.
         // If values are very large, 1.0 makes no difference.
         // If values are zero, the 1.0 should mean the reference residual
@@ -1123,6 +1151,7 @@ void performNewtonKrylovUpdates(int snapshotStart, double startCFL, int maxCPUs,
         foreach (ref residual; referenceResiduals) residual += to!number(1.0);
 
         if (nkCfg.numberOfStepsForSettingReferenceResiduals == 0) {
+            writeDiagnostics(0, 0.0, cfl, 0.0, 0.0, 0.0, 1.0, 0, residualsUpToDate);
             referenceResidualsAreSet = true;
             if (GlobalConfig.is_master_task) {
                 writeln("*************************************************************************");
@@ -1290,6 +1319,11 @@ void performNewtonKrylovUpdates(int snapshotStart, double startCFL, int maxCPUs,
             // We think??? If not, we bail at this point.
             try {
                 applyNewtonUpdate(omega);
+
+                // Update the residual state as soon as the Newton update is accepted;
+                // the stopping checks use the updated global residual value.
+                assembleResidualVector(0, currentPhase, stepsIntoCurrentPhase);
+                computeGlobalResidual();
             }
             catch (NewtonKrylovException e) {
                 // We need to bail out at this point.
@@ -1344,7 +1378,7 @@ void performNewtonKrylovUpdates(int snapshotStart, double startCFL, int maxCPUs,
         if (!referenceResidualsAreSet) {
             referenceGlobalResidual = fmax(referenceGlobalResidual, globalResidual);
             if (!residualsUpToDate) {
-                computeResiduals(currentResiduals);
+                computeMaxResiduals(currentResiduals);
                 residualsUpToDate = true;
             }
             foreach (ivar; 0 .. nConserved) {
@@ -1661,7 +1695,7 @@ void setPhaseSettings(size_t phase)
     }
 }
 
-void computeResiduals(ref ConservedQuantities residuals)
+void computeMaxResiduals(ref ConservedQuantities residuals)
 {
     size_t nConserved = GlobalConfig.cqi.n;
     foreach (blk; parallel(localFluidBlocks,1)) {
@@ -1797,7 +1831,6 @@ foreach (blk; localFluidBlocks) `~norm2~` += blk.normAcc;
 
 }
 
-
 /**
  * This function solves a linear system to provide a Newton step for the flow field.
  *
@@ -1877,11 +1910,7 @@ void solveNewtonStep(bool updatePreconditionerThisStep,
      *---
      */
 
-    evalResidual(0, currentPhase, stepsIntoCurrentPhase);
-
-    setResiduals();
-
-    if (nkCfg.dualTime) { addUnsteadyTermToResiduals(); }
+    assembleResidualVector(0, currentPhase, stepsIntoCurrentPhase);
 
     if (nkCfg.useRealValuedFrechetDerivative) { setR0(currentPhase, stepsIntoCurrentPhase); }
 
@@ -2054,11 +2083,7 @@ void solveNewtonStepFGMRES(size_t currentPhase, int stepsIntoCurrentPhase)
      *---
      */
 
-    evalResidual(0, currentPhase, stepsIntoCurrentPhase);
-
-    setResiduals();
-
-    if (nkCfg.dualTime) { addUnsteadyTermToResiduals(); }
+    assembleResidualVector(0, currentPhase, stepsIntoCurrentPhase);
 
     if (nkCfg.useRealValuedFrechetDerivative) { setR0(currentPhase, stepsIntoCurrentPhase); }
 
@@ -2172,12 +2197,29 @@ void solveNewtonStepFGMRES(size_t currentPhase, int stepsIntoCurrentPhase)
 }
 
 /**
+ * Evaluate the residuals for the requested flow-time level and assemble
+ * the residual vector R from that same level.
+ *
+ * For dual-time stepping, the unsteady term is also included in R.
+ *
+ * Authors: RJG and KAD
+ * Date: 2026-06-04
+ */
+void assembleResidualVector(int ftl, size_t currentPhase, int stepsIntoCurrentPhase)
+{
+    evalResidual(ftl, currentPhase, stepsIntoCurrentPhase);
+    fillResidualVector(ftl);
+    if (nkCfg.dualTime) { addUnsteadyTermToResidualVector(ftl); }
+}
+
+/**
  * Copy values from dUdt into R.
  *
  * Authors: RJG and KAD
  * Date: 2022-03-02
  */
-void setResiduals(int ftl=0)
+
+void fillResidualVector(int ftl=0)
 {
     size_t nConserved = GlobalConfig.cqi.n;
     foreach (blk; parallel(localFluidBlocks,1)) {
@@ -2366,10 +2408,6 @@ void determineScaleFactors(ref ScaleFactors rowScale, ref ScaleFactors invColSca
 
 /**
  * Compute the global residual based on vector R.
- *
- * For certain turbulence models, we scale the contribution in the global residual
- * so that certain quantities do not dominate this norm. For example, the turbulent
- * kinetic energy in the k-omega model has its contribution scaled down.
  *
  * Authors: KAD and RJG
  * Date: 2022-03-02
@@ -3945,9 +3983,7 @@ double applyLineSearch(double omega, size_t currentPhase, int stepsIntoCurrentPh
                 startIdx += nConserved;
             }
         }
-        evalResidual(1, currentPhase, stepsIntoCurrentPhase);
-        setResiduals(1);
-        if (nkCfg.dualTime) { addUnsteadyTermToResiduals(1); }
+        assembleResidualVector(1, currentPhase, stepsIntoCurrentPhase);
         foreach (blk; parallel(localFluidBlocks,1)) {
             size_t startIdx = 0;
             foreach (cell; blk.cells) {
@@ -4154,7 +4190,7 @@ void writeDiagnostics(int step, double dt, double cfl, double wallClockElapsed, 
 
     double massBalance = compute_mass_balance();
     if (!residualsUpToDate) {
-        computeResiduals(currentResiduals);
+        computeMaxResiduals(currentResiduals);
         residualsUpToDate = true;
     }
 
@@ -4186,7 +4222,7 @@ void writeSnapshot(int step, double dt, double cfl, int currentPhase, int stepsI
     }
 
     if (!residualsUpToDate) {
-	computeResiduals(currentResiduals);
+	computeMaxResiduals(currentResiduals);
 	residualsUpToDate = true;
     }
 
@@ -4330,7 +4366,7 @@ void printStatusToScreen(int step, double cfl, double dt, double wallClockElapse
     alias cfg = GlobalConfig;
 
     if (!residualsUpToDate) {
-        computeResiduals(currentResiduals);
+        computeMaxResiduals(currentResiduals);
         residualsUpToDate = true;
     }
 
@@ -4554,3 +4590,91 @@ string sgs_solve(string lhs_vec, string rhs_vec)
     return code;
 }
 
+bool readLimiterValues(int snapshot)
+{
+    /*
+    Reads limiter values from file.
+
+    TODO: A similar function is used in the check-jacobian command. We should consolidate these into a single shared definition. KAD 2026-05
+    */
+    alias cfg = GlobalConfig;
+
+    if (!exists(lmrCfg.limiterMetadataFile)) {
+        // no limiter metadata found so we continue without reading in any limiter values
+        return false;
+    } else {
+        if (cfg.is_master_task) {
+            writeln("--> Detected saved unstructured grid limiter values; reading from snapshot: ", snapshot);
+        }
+    }
+
+    double[][] data;
+    string[] variables;
+    string fileFmt;
+
+    fileFmt = cfg.field_format;
+    variables = readVariablesFromMetadata(lmrCfg.limiterMetadataFile);
+    size_t[string] variableIndex;
+    foreach (i, var; variables) variableIndex[var] = i;
+    auto soln = new FlowSolution(to!int(snapshot), cfg.nFluidBlocks);
+    foreach (blk; localFluidBlocks) {
+        auto limiterFilename = limiterFilename(to!int(snapshot), to!int(blk.id));
+        if (!exists(limiterFilename)) {
+            if (cfg.is_master_task) {
+                string errMsg = "Found limiter metadata, but no limiter snapshot files at the specified snapshot.\n";
+                errMsg ~= format("You selected snapshot: %d\n", snapshot);
+                errMsg ~= "Bailing out.\n";
+                throw new NewtonKrylovException(errMsg);
+            }
+        }
+        readValuesFromFile(data, limiterFilename, variables, soln.flowBlocks[blk.id].ncells, fileFmt);
+        foreach (j, cell; blk.cells) {
+            cell.gradients.velxPhi = data[j][variableIndex["vel.x"]];
+            cell.gradients.velyPhi = data[j][variableIndex["vel.y"]];
+            if (cfg.dimensions == 3) {
+                cell.gradients.velzPhi = data[j][variableIndex["vel.z"]];
+            } else {
+                cell.gradients.velzPhi = 0.0;
+            }
+            final switch (cfg.thermo_interpolator) {
+                case InterpolateOption.pt:
+                    cell.gradients.pPhi = data[j][variableIndex["p"]];
+                    cell.gradients.TPhi = data[j][variableIndex["T"]];
+                    break;
+                case InterpolateOption.rhou:
+                    cell.gradients.rhoPhi = data[j][variableIndex["rho"]];
+                    cell.gradients.uPhi = data[j][variableIndex["e"]];
+                    break;
+                case InterpolateOption.rhop:
+                    cell.gradients.rhoPhi = data[j][variableIndex["rho"]];
+                    cell.gradients.pPhi = data[j][variableIndex["p"]];
+                    break;
+                case InterpolateOption.rhot:
+                    cell.gradients.rhoPhi = data[j][variableIndex["rho"]];
+                    cell.gradients.TPhi = data[j][variableIndex["T"]];
+                    break;
+            }
+            foreach (isp; 0 .. cfg.gmodel_master.n_species) {
+                cell.gradients.rho_sPhi[isp] = data[j][variableIndex["massf-" ~ cfg.gmodel_master.species_name(isp)]];
+            }
+            foreach (imode; 0 .. cfg.gmodel_master.n_modes) {
+                if (cfg.thermo_interpolator == InterpolateOption.rhou ||
+                    cfg.thermo_interpolator == InterpolateOption.rhop ) {
+                    cell.gradients.u_modesPhi[imode] = data[j][variableIndex["e-" ~ cfg.gmodel_master.energy_mode_name(imode)]];
+                }
+                else {
+                    cell.gradients.T_modesPhi[imode] = data[j][variableIndex["T-" ~ cfg.gmodel_master.energy_mode_name(imode)]];
+                }
+            }
+            if (cfg.turbulence_model_name != "none") {
+                foreach (iturb; 0 .. cfg.turb_model.nturb) {
+                    cell.gradients.turbPhi[iturb] = data[j][variableIndex["tq-" ~ cfg.turb_model.primitive_variable_name(iturb)]];
+                }
+            }
+            if (cfg.MHD) {
+                writeln("WARNING: we currently do not support reading MHD limiter values, proceeding with re-evaluated MHD limiter values.");
+            }
+        }
+    }
+    return true;
+}
